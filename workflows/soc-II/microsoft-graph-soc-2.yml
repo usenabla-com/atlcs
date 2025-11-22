@@ -1,9 +1,0 @@
-// Extract relevant CMMC logs
-// Extract relevant CMMC Settings
-// Extract relevant CMMC Artifacts
-// Extract relevant CMMC Network Traffic
-// Extract relevant CMMC User Activity
-// Extract relevant CMMC System Configurations
-// Extract relevant CMMC Vulnerability Scans
-// Extract relevant CMMC Incident Reports
-// Map extracted data to CMMC controls using the mapping API

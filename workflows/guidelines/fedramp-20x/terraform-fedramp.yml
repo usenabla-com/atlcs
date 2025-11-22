@@ -1,0 +1,492 @@
+# Terraform to FedRAMP 20x/CMMC Mapping Workflow
+#
+# This workflow collects Terraform state and maps infrastructure resources
+# to FedRAMP 20x Phase Two KSIs or CMMC 2.0 practices.
+#
+# Prerequisites:
+#   - Terraform state accessible from configured backend
+#   - Mapping API running and accessible
+#   - JWT token for Mapping API authentication
+#
+# Supported Backends:
+#   - local: Local terraform state file
+#   - s3: AWS S3 backend
+#   - azurerm: Azure Storage backend
+#   - gcs: Google Cloud Storage backend
+#   - terraform-cloud: Terraform Cloud/Enterprise
+#
+# Required Secrets (GitHub Actions):
+#   - MAPPING_API_URL: Base URL of the Mapping API
+#   - MAPPING_API_TOKEN: JWT token for API authentication
+#   - For S3: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   - For Azure: AZURE_STORAGE_KEY (or use managed identity)
+#   - For GCS: GCP_SERVICE_ACCOUNT_KEY (base64 encoded)
+#   - For TFC: TFC_TOKEN
+
+name: Terraform FedRAMP 20x/CMMC Compliance Assessment
+
+on:
+  # Run on schedule (weekly on Sunday at 3 AM UTC)
+  schedule:
+    - cron: '0 3 * * 0'
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      backend_type:
+        description: 'Terraform state backend type'
+        required: true
+        default: 's3'
+        type: choice
+        options:
+          - local
+          - s3
+          - azurerm
+          - gcs
+          - terraform-cloud
+      state_identifier:
+        description: 'State identifier (bucket/key for S3, workspace for TFC, etc.)'
+        required: true
+        default: 'terraform-state/prod/terraform.tfstate'
+      evidence_types:
+        description: 'Comma-separated evidence types (leave empty for full_state)'
+        required: false
+        default: ''
+      framework:
+        description: 'Target compliance framework'
+        required: true
+        default: 'fedramp20x'
+        type: choice
+        options:
+          - fedramp20x
+          - cmmc
+      report_format:
+        description: 'Report output format'
+        required: true
+        default: 'json'
+        type: choice
+        options:
+          - json
+          - markdown
+          - summary
+
+env:
+  MAPPING_API_URL: ${{ secrets.MAPPING_API_URL }}
+  MAPPING_API_TOKEN: ${{ secrets.MAPPING_API_TOKEN }}
+
+jobs:
+  # Job 1: Collect Terraform state
+  collect-state:
+    name: Collect Terraform State
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        evidence_type:
+          - full_state
+          - aws_resources
+          - azure_resources
+          - gcp_resources
+          - kubernetes_resources
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if evidence type should be collected
+        id: check
+        run: |
+          INPUT_TYPES="${{ github.event.inputs.evidence_types }}"
+          CURRENT_TYPE="${{ matrix.evidence_type }}"
+
+          # If no specific types requested and this is full_state, collect it
+          if [[ -z "$INPUT_TYPES" && "$CURRENT_TYPE" == "full_state" ]]; then
+            echo "collect=true" >> $GITHUB_OUTPUT
+          # If specific types requested, check if current type is in the list
+          elif [[ -n "$INPUT_TYPES" ]] && echo "$INPUT_TYPES" | grep -q "$CURRENT_TYPE"; then
+            echo "collect=true" >> $GITHUB_OUTPUT
+          # If full_state requested explicitly
+          elif [[ -n "$INPUT_TYPES" ]] && echo "$INPUT_TYPES" | grep -q "full_state" && "$CURRENT_TYPE" == "full_state"; then
+            echo "collect=true" >> $GITHUB_OUTPUT
+          else
+            echo "collect=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials (for S3 backend)
+        if: steps.check.outputs.collect == 'true' && github.event.inputs.backend_type == 's3'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Configure Azure credentials (for Azure backend)
+        if: steps.check.outputs.collect == 'true' && github.event.inputs.backend_type == 'azurerm'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Configure GCP credentials (for GCS backend)
+        if: steps.check.outputs.collect == 'true' && github.event.inputs.backend_type == 'gcs'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Install dependencies
+        if: steps.check.outputs.collect == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+          # Install cloud CLIs as needed
+          if [[ "${{ github.event.inputs.backend_type }}" == "gcs" ]]; then
+            curl https://sdk.cloud.google.com | bash
+            echo "$HOME/google-cloud-sdk/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Parse state identifier
+        if: steps.check.outputs.collect == 'true'
+        id: parse
+        run: |
+          IDENTIFIER="${{ github.event.inputs.state_identifier }}"
+          BACKEND="${{ github.event.inputs.backend_type }}"
+
+          case "$BACKEND" in
+            s3)
+              # Format: bucket/key or bucket:key
+              BUCKET=$(echo "$IDENTIFIER" | cut -d'/' -f1 | cut -d':' -f1)
+              KEY=$(echo "$IDENTIFIER" | cut -d'/' -f2- | cut -d':' -f2-)
+              echo "s3_bucket=$BUCKET" >> $GITHUB_OUTPUT
+              echo "s3_key=$KEY" >> $GITHUB_OUTPUT
+              ;;
+            azurerm)
+              # Format: storage-account/container/key
+              STORAGE=$(echo "$IDENTIFIER" | cut -d'/' -f1)
+              CONTAINER=$(echo "$IDENTIFIER" | cut -d'/' -f2)
+              KEY=$(echo "$IDENTIFIER" | cut -d'/' -f3-)
+              echo "azure_storage=$STORAGE" >> $GITHUB_OUTPUT
+              echo "azure_container=$CONTAINER" >> $GITHUB_OUTPUT
+              echo "azure_key=$KEY" >> $GITHUB_OUTPUT
+              ;;
+            gcs)
+              # Format: bucket/prefix
+              BUCKET=$(echo "$IDENTIFIER" | cut -d'/' -f1)
+              PREFIX=$(echo "$IDENTIFIER" | cut -d'/' -f2-)
+              echo "gcs_bucket=$BUCKET" >> $GITHUB_OUTPUT
+              echo "gcs_prefix=$PREFIX" >> $GITHUB_OUTPUT
+              ;;
+            terraform-cloud)
+              # Format: org/workspace
+              ORG=$(echo "$IDENTIFIER" | cut -d'/' -f1)
+              WORKSPACE=$(echo "$IDENTIFIER" | cut -d'/' -f2)
+              echo "tfc_org=$ORG" >> $GITHUB_OUTPUT
+              echo "tfc_workspace=$WORKSPACE" >> $GITHUB_OUTPUT
+              ;;
+            local)
+              echo "state_file=$IDENTIFIER" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Collect Terraform state
+        if: steps.check.outputs.collect == 'true'
+        env:
+          TFC_TOKEN: ${{ secrets.TFC_TOKEN }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+        run: |
+          chmod +x ./workflows/scripts/collect-terraform-state.sh
+
+          BACKEND="${{ github.event.inputs.backend_type }}"
+          EVIDENCE_TYPE="${{ matrix.evidence_type }}"
+          OUTPUT_FILE="./evidence-terraform-${EVIDENCE_TYPE}.json"
+
+          case "$BACKEND" in
+            s3)
+              ./workflows/scripts/collect-terraform-state.sh \
+                s3 "$OUTPUT_FILE" \
+                --bucket "${{ steps.parse.outputs.s3_bucket }}" \
+                --key "${{ steps.parse.outputs.s3_key }}" \
+                --evidence-type "$EVIDENCE_TYPE"
+              ;;
+            azurerm)
+              ./workflows/scripts/collect-terraform-state.sh \
+                azurerm "$OUTPUT_FILE" \
+                --storage-account "${{ steps.parse.outputs.azure_storage }}" \
+                --container "${{ steps.parse.outputs.azure_container }}" \
+                --key "${{ steps.parse.outputs.azure_key }}" \
+                --evidence-type "$EVIDENCE_TYPE"
+              ;;
+            gcs)
+              ./workflows/scripts/collect-terraform-state.sh \
+                gcs "$OUTPUT_FILE" \
+                --bucket "${{ steps.parse.outputs.gcs_bucket }}" \
+                --prefix "${{ steps.parse.outputs.gcs_prefix }}" \
+                --evidence-type "$EVIDENCE_TYPE"
+              ;;
+            terraform-cloud)
+              ./workflows/scripts/collect-terraform-state.sh \
+                terraform-cloud "$OUTPUT_FILE" \
+                --org "${{ steps.parse.outputs.tfc_org }}" \
+                --workspace "${{ steps.parse.outputs.tfc_workspace }}" \
+                --evidence-type "$EVIDENCE_TYPE"
+              ;;
+            local)
+              ./workflows/scripts/collect-terraform-state.sh \
+                local "$OUTPUT_FILE" \
+                --state-file "${{ steps.parse.outputs.state_file }}" \
+                --evidence-type "$EVIDENCE_TYPE"
+              ;;
+          esac
+
+      - name: Upload evidence artifact
+        if: steps.check.outputs.collect == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-terraform-${{ matrix.evidence_type }}
+          path: ./evidence-terraform-${{ matrix.evidence_type }}.json
+          retention-days: 7
+
+  # Job 2: Map Terraform state to framework
+  map-evidence:
+    name: Map Evidence to Framework
+    runs-on: ubuntu-latest
+    needs: collect-state
+
+    strategy:
+      matrix:
+        evidence_type:
+          - full_state
+          - aws_resources
+          - azure_resources
+          - gcp_resources
+          - kubernetes_resources
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download evidence artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: evidence-terraform-${{ matrix.evidence_type }}
+          path: ./evidence
+        continue-on-error: true
+
+      - name: Check if evidence exists
+        id: check
+        run: |
+          if [[ -f "./evidence/evidence-terraform-${{ matrix.evidence_type }}.json" ]]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Map Terraform state to framework
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          FRAMEWORK="${{ github.event.inputs.framework || 'fedramp20x' }}"
+          EVIDENCE_FILE="./evidence/evidence-terraform-${{ matrix.evidence_type }}.json"
+          OUTPUT_FILE="./results-terraform-${{ matrix.evidence_type }}.json"
+
+          # Extract evidence data
+          STATE_ID=$(jq -r '.state_id' "$EVIDENCE_FILE")
+          EVIDENCE_TYPE=$(jq -r '.evidence_type' "$EVIDENCE_FILE")
+          COLLECTED_AT=$(jq -r '.collected_at' "$EVIDENCE_FILE")
+          DATA=$(jq '.data' "$EVIDENCE_FILE")
+
+          # Build request body for unified endpoint
+          REQUEST_BODY=$(jq -n \
+            --arg source "terraform" \
+            --arg framework "$FRAMEWORK" \
+            --arg source_id "$STATE_ID" \
+            --arg evidence_type "$EVIDENCE_TYPE" \
+            --arg collected_at "$COLLECTED_AT" \
+            --argjson data "$DATA" \
+            '{
+              source: $source,
+              framework: $framework,
+              source_id: $source_id,
+              evidence_type: $evidence_type,
+              collected_at: $collected_at,
+              data: $data
+            }')
+
+          # Call unified mapping endpoint
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "${MAPPING_API_URL}/api/v1/frameworks/map" \
+            -H "Authorization: Bearer ${MAPPING_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST_BODY")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "Error: API returned HTTP $HTTP_CODE"
+            echo "$BODY"
+            exit 1
+          fi
+
+          echo "$BODY" | jq '.' > "$OUTPUT_FILE"
+          echo "Mapping results written to $OUTPUT_FILE"
+
+      - name: Upload mapping results
+        if: steps.check.outputs.exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-terraform-${{ matrix.evidence_type }}
+          path: ./results-terraform-${{ matrix.evidence_type }}.json
+          retention-days: 30
+
+  # Job 3: Generate consolidated report
+  generate-report:
+    name: Generate Compliance Report
+    runs-on: ubuntu-latest
+    needs: map-evidence
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all mapping results
+        uses: actions/download-artifact@v4
+        with:
+          path: ./results
+          pattern: results-terraform-*
+          merge-multiple: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Generate report
+        run: |
+          FORMAT="${{ github.event.inputs.report_format || 'json' }}"
+          FRAMEWORK="${{ github.event.inputs.framework || 'fedramp20x' }}"
+
+          mkdir -p ./reports
+
+          # Generate consolidated JSON report
+          echo "{" > "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+          echo "  \"framework\": \"$FRAMEWORK\"," >> "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+          echo "  \"source\": \"terraform\"," >> "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+          echo "  \"generated_at\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"," >> "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+          echo "  \"results\": [" >> "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+
+          FIRST=true
+          for file in ./results/results-terraform-*.json; do
+            if [[ -f "$file" ]]; then
+              if [[ "$FIRST" != "true" ]]; then
+                echo "," >> "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+              fi
+              cat "$file" >> "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+              FIRST=false
+            fi
+          done
+
+          echo "  ]" >> "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+          echo "}" >> "./reports/terraform-${FRAMEWORK}-compliance-report.json"
+
+          # Generate markdown report if requested
+          if [[ "$FORMAT" == "markdown" ]]; then
+            chmod +x ./workflows/scripts/generate-report.sh
+            ./workflows/scripts/generate-report.sh \
+              "./results" \
+              "./reports/terraform-${FRAMEWORK}-compliance-report.md" \
+              "markdown"
+          fi
+
+      - name: Display summary
+        run: |
+          FRAMEWORK="${{ github.event.inputs.framework || 'fedramp20x' }}"
+
+          echo "## Terraform $FRAMEWORK Compliance Assessment Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Evidence Collection Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          for file in ./results/results-terraform-*.json; do
+            if [[ -f "$file" ]]; then
+              EVIDENCE_TYPE=$(basename "$file" .json | sed 's/results-terraform-//')
+
+              if [[ "$FRAMEWORK" == "fedramp20x" ]]; then
+                # FedRAMP response format
+                if jq -e '.overall_status' "$file" > /dev/null 2>&1; then
+                  SCORE=$(jq -r '.overall_status.score | floor' "$file")
+                  COMPLIANT=$(jq -r '.overall_status.compliant' "$file")
+                  NON_COMPLIANT=$(jq -r '.overall_status.non_compliant' "$file")
+                  echo "- **$EVIDENCE_TYPE**: Score ${SCORE}% (Compliant: $COMPLIANT, Non-compliant: $NON_COMPLIANT)" >> $GITHUB_STEP_SUMMARY
+                fi
+              else
+                # CMMC response format
+                if jq -e '.summary' "$file" > /dev/null 2>&1; then
+                  TOTAL=$(jq -r '.summary.total_practices_mapped' "$file")
+                  L1=$(jq -r '.summary.level1_practices' "$file")
+                  L2=$(jq -r '.summary.level2_practices' "$file")
+                  L3=$(jq -r '.summary.level3_practices' "$file")
+                  echo "- **$EVIDENCE_TYPE**: $TOTAL practices (L1: $L1, L2: $L2, L3: $L3)" >> $GITHUB_STEP_SUMMARY
+                fi
+              fi
+            fi
+          done
+
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-compliance-report
+          path: ./reports/
+          retention-days: 90
+
+  # Job 4: Send notifications
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: generate-report
+    if: always()
+
+    steps:
+      - name: Download compliance report
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-compliance-report
+          path: ./reports
+        continue-on-error: true
+
+      - name: Check for critical findings
+        id: check-critical
+        run: |
+          CRITICAL_COUNT=0
+          FRAMEWORK="${{ github.event.inputs.framework || 'fedramp20x' }}"
+
+          for file in ./reports/*.json; do
+            if [[ -f "$file" ]]; then
+              if [[ "$FRAMEWORK" == "fedramp20x" ]]; then
+                COUNT=$(jq '[.results[]?.ksi_results[]? | select(.status == "non_compliant") | .checks[]? | select(.severity == "High" and .passed == false)] | length' "$file" 2>/dev/null || echo "0")
+              else
+                COUNT=$(jq '[.results[]?.mapped_practices[]? | select(.relevance == "direct")] | length' "$file" 2>/dev/null || echo "0")
+              fi
+              CRITICAL_COUNT=$((CRITICAL_COUNT + COUNT))
+            fi
+          done
+
+          echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+
+          if [[ $CRITICAL_COUNT -gt 0 ]]; then
+            echo "has_critical=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_critical=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify on findings
+        if: steps.check-critical.outputs.has_critical == 'true'
+        run: |
+          echo "::warning::Found ${{ steps.check-critical.outputs.critical_count }} findings requiring attention!"
+          # Future: Add Slack/Teams/Email notification integration here

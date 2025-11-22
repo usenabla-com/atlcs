@@ -17,8 +17,10 @@ mod validators;
 use auth::auth_middleware;
 use handlers::cmmc::{get_practice, get_summary, list_practices};
 use handlers::ksis::{get_ksi, list_ksis};
-use handlers::microsoft_graph::{list_evidence_types, map_microsoft_graph_evidence};
+use handlers::microsoft_graph::{list_evidence_types as list_msgraph_evidence_types, map_microsoft_graph_evidence};
+use handlers::terraform::{list_terraform_evidence_types, map_terraform_evidence};
 use handlers::tokens::generate_dev_token;
+use handlers::unified::{list_evidence_types as unified_list_evidence_types, map_evidence as unified_map_evidence};
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -115,6 +117,30 @@ async fn api_info() -> Json<ApiInfo> {
                 description: "Get CMMC practice summary by level and domain",
                 auth_required: true,
             },
+            EndpointInfo {
+                method: "GET",
+                path: "/api/v1/sources/terraform/evidence-types",
+                description: "List available Terraform evidence types",
+                auth_required: true,
+            },
+            EndpointInfo {
+                method: "POST",
+                path: "/api/v1/sources/terraform/map",
+                description: "Map Terraform state to FedRAMP 20x KSIs or CMMC practices",
+                auth_required: true,
+            },
+            EndpointInfo {
+                method: "GET",
+                path: "/api/v1/frameworks/evidence-types",
+                description: "List all evidence types (unified endpoint, optional ?source= filter)",
+                auth_required: true,
+            },
+            EndpointInfo {
+                method: "POST",
+                path: "/api/v1/frameworks/map",
+                description: "Map evidence to frameworks (unified endpoint)",
+                auth_required: true,
+            },
         ],
     })
 }
@@ -138,15 +164,30 @@ fn protected_routes() -> Router {
             get(get_practice),
         )
         .route("/api/v1/frameworks/cmmc/summary", get(get_summary))
-        // Microsoft Graph source routes
+        // Microsoft Graph source routes (legacy)
         .route(
             "/api/v1/sources/microsoft-graph/evidence-types",
-            get(list_evidence_types),
+            get(list_msgraph_evidence_types),
         )
         .route(
             "/api/v1/sources/microsoft-graph/map",
             post(map_microsoft_graph_evidence),
         )
+        // Terraform source routes (legacy)
+        .route(
+            "/api/v1/sources/terraform/evidence-types",
+            get(list_terraform_evidence_types),
+        )
+        .route(
+            "/api/v1/sources/terraform/map",
+            post(map_terraform_evidence),
+        )
+        // Unified endpoints (preferred)
+        .route(
+            "/api/v1/frameworks/evidence-types",
+            get(unified_list_evidence_types),
+        )
+        .route("/api/v1/frameworks/map", post(unified_map_evidence))
         .layer(middleware::from_fn(auth_middleware))
 }
 
@@ -189,6 +230,11 @@ async fn main() {
     tracing::info!("  GET  /api/v1/frameworks/cmmc/summary");
     tracing::info!("  GET  /api/v1/sources/microsoft-graph/evidence-types");
     tracing::info!("  POST /api/v1/sources/microsoft-graph/map");
+    tracing::info!("  GET  /api/v1/sources/terraform/evidence-types");
+    tracing::info!("  POST /api/v1/sources/terraform/map");
+    tracing::info!("Unified endpoints (preferred):");
+    tracing::info!("  GET  /api/v1/frameworks/evidence-types");
+    tracing::info!("  POST /api/v1/frameworks/map");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

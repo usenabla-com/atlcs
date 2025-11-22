@@ -1,0 +1,296 @@
+# Microsoft Graph to FedRAMP 20x Mapping Workflow
+#
+# This workflow collects evidence from Microsoft Graph API and maps it to
+# FedRAMP 20x Phase Two Key Security Indicators (KSIs).
+#
+# Prerequisites:
+#   - Azure AD App Registration with appropriate Microsoft Graph permissions
+#   - Mapping API running and accessible
+#   - JWT token for Mapping API authentication
+#
+# Required Secrets (GitHub Actions):
+#   - AZURE_TENANT_ID: Azure AD tenant ID
+#   - AZURE_CLIENT_ID: Azure AD application (client) ID
+#   - AZURE_CLIENT_SECRET: Azure AD client secret
+#   - MAPPING_API_URL: Base URL of the Mapping API
+#   - MAPPING_API_TOKEN: JWT token for API authentication
+
+name: Microsoft Graph FedRAMP 20x Compliance Assessment
+
+on:
+  # Run on schedule (daily at 2 AM UTC)
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      evidence_types:
+        description: 'Comma-separated list of evidence types to collect (leave empty for all)'
+        required: false
+        default: ''
+      framework:
+        description: 'Target framework'
+        required: true
+        default: 'fedramp20x'
+        type: choice
+        options:
+          - fedramp20x
+          - cmmc
+      report_format:
+        description: 'Report output format'
+        required: true
+        default: 'json'
+        type: choice
+        options:
+          - json
+          - markdown
+          - summary
+
+env:
+  MAPPING_API_URL: ${{ secrets.MAPPING_API_URL }}
+  MAPPING_API_TOKEN: ${{ secrets.MAPPING_API_TOKEN }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+jobs:
+  # Job 1: Collect evidence from Microsoft Graph
+  collect-evidence:
+    name: Collect Microsoft Graph Evidence
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        evidence_type:
+          - conditional_access_policies
+          - user_mfa_status
+          - sign_in_logs
+          - audit_logs
+          - directory_roles
+          - security_alerts
+          - compliance_policies
+          - device_configurations
+          - risk_detections
+          - secure_score
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if evidence type should be collected
+        id: check
+        run: |
+          INPUT_TYPES="${{ github.event.inputs.evidence_types }}"
+          CURRENT_TYPE="${{ matrix.evidence_type }}"
+
+          if [[ -z "$INPUT_TYPES" ]]; then
+            echo "collect=true" >> $GITHUB_OUTPUT
+          elif echo "$INPUT_TYPES" | grep -q "$CURRENT_TYPE"; then
+            echo "collect=true" >> $GITHUB_OUTPUT
+          else
+            echo "collect=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.collect == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Collect ${{ matrix.evidence_type }} evidence
+        if: steps.check.outputs.collect == 'true'
+        run: |
+          chmod +x ./workflows/scripts/collect-msgraph-evidence.sh
+          ./workflows/scripts/collect-msgraph-evidence.sh \
+            "${{ matrix.evidence_type }}" \
+            "./evidence-${{ matrix.evidence_type }}.json"
+
+      - name: Upload evidence artifact
+        if: steps.check.outputs.collect == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ matrix.evidence_type }}
+          path: ./evidence-${{ matrix.evidence_type }}.json
+          retention-days: 7
+
+  # Job 2: Map evidence to FedRAMP 20x KSIs
+  map-evidence:
+    name: Map Evidence to Framework
+    runs-on: ubuntu-latest
+    needs: collect-evidence
+
+    strategy:
+      matrix:
+        evidence_type:
+          - conditional_access_policies
+          - user_mfa_status
+          - sign_in_logs
+          - audit_logs
+          - directory_roles
+          - security_alerts
+          - compliance_policies
+          - device_configurations
+          - risk_detections
+          - secure_score
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download evidence artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: evidence-${{ matrix.evidence_type }}
+          path: ./evidence
+        continue-on-error: true
+
+      - name: Check if evidence exists
+        id: check
+        run: |
+          if [[ -f "./evidence/evidence-${{ matrix.evidence_type }}.json" ]]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Map ${{ matrix.evidence_type }} to framework
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          FRAMEWORK="${{ github.event.inputs.framework || 'fedramp20x' }}"
+
+          chmod +x ./workflows/scripts/map-evidence.sh
+          ./workflows/scripts/map-evidence.sh \
+            "./evidence/evidence-${{ matrix.evidence_type }}.json" \
+            "$FRAMEWORK" \
+            "./results-${{ matrix.evidence_type }}.json"
+
+      - name: Upload mapping results
+        if: steps.check.outputs.exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.evidence_type }}
+          path: ./results-${{ matrix.evidence_type }}.json
+          retention-days: 30
+
+  # Job 3: Generate consolidated report
+  generate-report:
+    name: Generate Compliance Report
+    runs-on: ubuntu-latest
+    needs: map-evidence
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all mapping results
+        uses: actions/download-artifact@v4
+        with:
+          path: ./results
+          pattern: results-*
+          merge-multiple: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Generate report
+        run: |
+          FORMAT="${{ github.event.inputs.report_format || 'json' }}"
+          FRAMEWORK="${{ github.event.inputs.framework || 'fedramp20x' }}"
+
+          mkdir -p ./reports
+          chmod +x ./workflows/scripts/generate-report.sh
+
+          # Generate JSON report (always)
+          ./workflows/scripts/generate-report.sh \
+            "./results" \
+            "./reports/${FRAMEWORK}-compliance-report.json" \
+            "json"
+
+          # Generate requested format if different
+          if [[ "$FORMAT" != "json" ]]; then
+            ./workflows/scripts/generate-report.sh \
+              "./results" \
+              "./reports/${FRAMEWORK}-compliance-report.${FORMAT}" \
+              "$FORMAT"
+          fi
+
+      - name: Display summary
+        run: |
+          echo "## FedRAMP 20x Compliance Assessment Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ -f "./reports/fedramp20x-compliance-report.json" ]]; then
+            echo "### Overall Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            for file in ./results/results-*.json; do
+              if [[ -f "$file" ]]; then
+                EVIDENCE_TYPE=$(jq -r '.evidence_type' "$file")
+                if jq -e '.overall_status' "$file" > /dev/null 2>&1; then
+                  SCORE=$(jq -r '.overall_status.score | floor' "$file")
+                  COMPLIANT=$(jq -r '.overall_status.compliant' "$file")
+                  NON_COMPLIANT=$(jq -r '.overall_status.non_compliant' "$file")
+                  echo "- **$EVIDENCE_TYPE**: Score ${SCORE}% (Compliant: $COMPLIANT, Non-compliant: $NON_COMPLIANT)" >> $GITHUB_STEP_SUMMARY
+                fi
+              fi
+            done
+          fi
+
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-report
+          path: ./reports/
+          retention-days: 90
+
+  # Job 4: Send notifications (optional)
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: generate-report
+    if: always()
+
+    steps:
+      - name: Download compliance report
+        uses: actions/download-artifact@v4
+        with:
+          name: compliance-report
+          path: ./reports
+        continue-on-error: true
+
+      - name: Check for critical findings
+        id: check-critical
+        run: |
+          CRITICAL_COUNT=0
+
+          for file in ./reports/*.json; do
+            if [[ -f "$file" ]]; then
+              COUNT=$(jq '[.results[]?.ksi_results[]? | select(.status == "non_compliant") | .checks[]? | select(.severity == "critical" and .passed == false)] | length' "$file" 2>/dev/null || echo "0")
+              CRITICAL_COUNT=$((CRITICAL_COUNT + COUNT))
+            fi
+          done
+
+          echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+
+          if [[ $CRITICAL_COUNT -gt 0 ]]; then
+            echo "has_critical=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_critical=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify on critical findings
+        if: steps.check-critical.outputs.has_critical == 'true'
+        run: |
+          echo "::warning::Found ${{ steps.check-critical.outputs.critical_count }} critical compliance findings!"
+          # Future: Add Slack/Teams/Email notification integration here

@@ -2,7 +2,7 @@ use axum::{extract::Extension, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{Claims, Framework, LicenseType, Scope};
-use crate::catalogs::cmmc::{get_practices_by_nist_control, CmmcPractice};
+use crate::catalogs::cmmc::{get_practices_by_nist_control, nist_control_matches, CmmcPractice};
 use crate::validators::microsoft_graph::validate_microsoft_graph_evidence;
 use crate::validators::ValidationResponse;
 
@@ -198,7 +198,7 @@ fn map_to_cmmc(evidence: &MicrosoftGraphEvidence) -> CmmcMappingResponse {
                 let levels: Vec<String> = practice.levels.iter().map(|l| format!("{:?}", l)).collect();
                 let matched_controls: Vec<&str> = practice.nist_controls
                     .iter()
-                    .filter(|c| nist_controls.iter().any(|nc| c.starts_with(nc)))
+                    .filter(|c| nist_controls.iter().any(|nc| nist_control_matches(c, nc)))
                     .copied()
                     .collect();
 

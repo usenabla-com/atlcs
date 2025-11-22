@@ -1635,8 +1635,24 @@ pub fn get_practice_by_id(id: &str) -> Option<&'static CmmcPractice> {
 pub fn get_practices_by_nist_control(control: &str) -> Vec<&'static CmmcPractice> {
     CMMC_PRACTICES
         .iter()
-        .filter(|p| p.nist_controls.iter().any(|c| c.starts_with(control)))
+        .filter(|p| p.nist_controls.iter().any(|c| nist_control_matches(c, control)))
         .collect()
+}
+
+/// Check if a NIST control matches, handling the parent-child relationship properly.
+/// e.g., "AC-2" matches "AC-2", "AC-2(1)", "AC-2(2)" but NOT "AC-20" or "AC-21"
+pub fn nist_control_matches(practice_control: &str, search_control: &str) -> bool {
+    if practice_control == search_control {
+        return true;
+    }
+    // Check if practice_control is a sub-control of search_control
+    // e.g., "AC-2(1)" starts with "AC-2(" when searching for "AC-2"
+    if practice_control.starts_with(search_control) {
+        let remainder = &practice_control[search_control.len()..];
+        // Must be followed by '(' for sub-control or nothing for exact match
+        return remainder.starts_with('(') || remainder.is_empty();
+    }
+    false
 }
 
 /// Get Level 1 practices (17 basic practices - FCI protection)
