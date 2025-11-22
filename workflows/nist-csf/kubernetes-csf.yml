@@ -1,0 +1,8 @@
+// Extract kubernetes cluster manifest and configurations
+// Extract relevant CMMC logs
+// Extract relevant CMMC Settings
+// Extract relevant CMMC Artifacts
+// Extract relevant CMMC Network Traffic
+// Extract relevant CMMC User Activity
+// Extract relevant CMMC System Configurations
+// Map extracted data to CMMC controls using the mapping API

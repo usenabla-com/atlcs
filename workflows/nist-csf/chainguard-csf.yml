@@ -1,0 +1,3 @@
+// Fetch relevant CMMC settings and info about a given Chainguard registry
+// Extract relevant CMMC images and metadata
+// Map extracted data to CMMC controls using the mapping API

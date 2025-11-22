@@ -1,0 +1,31 @@
+// Create an action for taking screenshot evidence for CMMC controls
+// Require a valid URL input and a prompt for context
+// Use Browserbase Contexts
+
+// You should create a persistent context in Browserbase. This context stores cookies, local storage, session state, etc. 
+// Browserbase
+
+// When you launch a Browserbase session, you pass in the contextId and set persist: true so that after your session ends, updates to that context (e.g. new cookies from login) are saved. 
+// Browserbase
+
+// After a session ends, give it a brief delay before reusing the context to ensure the saved state has fully synced. 
+// Browserbase
+
+// First “Login” Run
+
+// In your GitHub Actions workflow, you’ll likely need a login step. That means: start a Browserbase session using the fresh context, navigate to the login page, perform the login (via automation), then close the session. During that run, because persist: true, the auth data (cookies, tokens) will be saved into the context. 
+// Browserbase
+
+// Alternatively (or in addition), you could use Session Live View to manually log in once (outside CI) and create the authenticated context. Then you capture its contextId and reuse it in your CI jobs. 
+// Browserbase
+
+// Subsequent Runs (in GitHub Actions)
+
+// In future workflow runs, you start new Browserbase sessions, but reuse the contextId you created. Because the context has the saved auth state, your session begins already authenticated. 
+// Browserbase
+
+// Then, in that session, you can navigate to the protected page and take your screenshot using the Browserbase API + CDP (or however you're doing screenshots).
+
+// Taking the Screenshot
+
+// After your session is running (authenticated), use the DevTools / CDP (or Playwright via Browserbase) to capture a screenshot. (Same as non-auth case, just now the page is authenticated.)
